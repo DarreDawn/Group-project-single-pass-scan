@@ -22,6 +22,11 @@ struct Descriptors {
     T* prefixes;
     unsigned* next_tile;
     unsigned* error;
+    // Fence-free single-word descriptors (paper §4.4): one uint64_t per tile
+    // packs {status, payload}. Allocated and zero-initialized (X) for every
+    // launch; only the FenceFree strategy dereferences it. Valid for
+    // sizeof(T) <= 4; u64 uses the two-array path above instead.
+    std::uint64_t* packed;
 };
 
 // Shared scratch for the first warp's look-back loop. Only lane 0 updates

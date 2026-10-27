@@ -47,9 +47,9 @@ private:
 constexpr int B = 128;
 constexpr int Q = 4;
 
-// Run one input through a selected P2 look-back strategy and compare every
+// Run one input through a selected P2/P3 look-back strategy and compare every
 // output element with the independent CPU inclusive-scan reference.
-template<class T, bool UseWarpReduction>
+template<class T, p2::ScanStrategy Strategy>
 bool run_case(std::size_t n, const std::string& pattern, uint64_t seed) {
     const std::size_t tile_size = static_cast<std::size_t>(B) * Q;
     const std::size_t num_tiles = step1_test::tile_count(n, tile_size);
@@ -66,22 +66,25 @@ bool run_case(std::size_t n, const std::string& pattern, uint64_t seed) {
         DeviceBuffer<T> d_input(n), d_output(n), d_aggregates(num_tiles),
             d_prefixes(num_tiles);
         DeviceBuffer<lookback::Flag> d_flags(num_tiles);
+        DeviceBuffer<uint64_t> d_packed(num_tiles);
         DeviceBuffer<unsigned> d_next(1), d_error(1);
 
         CUDA_CHECK(cudaMemcpy(
             d_input.get(), input.data(), n * sizeof(T), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemset(d_flags.get(), 0,
                               num_tiles * sizeof(lookback::Flag)));
+        CUDA_CHECK(cudaMemset(d_packed.get(), 0,
+                              num_tiles * sizeof(uint64_t)));
         CUDA_CHECK(cudaMemset(d_next.get(), 0, sizeof(unsigned)));
         CUDA_CHECK(cudaMemset(d_error.get(), 0, sizeof(unsigned)));
 
         p2::Descriptors<T> descriptors{
             d_flags.get(), d_aggregates.get(), d_prefixes.get(),
-            d_next.get(), d_error.get()};
+            d_next.get(), d_error.get(), d_packed.get()};
         constexpr std::size_t shared_bytes =
             sizeof(step1::BlockScanScratch<T, B, Q>);
 
-        p2::full_kernel<T, B, Q, UseWarpReduction>
+        p2::full_kernel<T, B, Q, Strategy>
             <<<static_cast<unsigned>(num_tiles), B, shared_bytes>>>(
                 d_input.get(), d_output.get(), n, num_tiles, descriptors);
         CUDA_CHECK(cudaGetLastError());
@@ -114,7 +117,7 @@ bool run_case(std::size_t n, const std::string& pattern, uint64_t seed) {
 }
 
 // Exercise empty input, short tails, tile boundaries, unsigned overflow, and
-// a multi-window look-back for both the serial and warp-reduction paths.
+// a multi-window look-back for every integrated look-back strategy.
 template<class T>
 bool run_type(const char* name) {
     struct Case {
@@ -133,11 +136,15 @@ bool run_type(const char* name) {
     };
     bool ok = true;
     for (const auto& test : cases) {
-        const bool serial = run_case<T, false>(
+        const bool baseline = run_case<T, p2::ScanStrategy::Baseline>(
             test.n, test.pattern, test.seed);
-        const bool reduced = run_case<T, true>(
+        const bool prefetch = run_case<T, p2::ScanStrategy::WarpPrefetch>(
             test.n, test.pattern, test.seed);
-        if (!serial || !reduced) {
+        const bool reduced = run_case<T, p2::ScanStrategy::WarpReduce>(
+            test.n, test.pattern, test.seed);
+        const bool fencefree = run_case<T, p2::ScanStrategy::FenceFree>(
+            test.n, test.pattern, test.seed);
+        if (!baseline || !prefetch || !reduced || !fencefree) {
             std::cerr << name << " failed at n=" << test.n
                       << " pattern=" << test.pattern << '\n';
             ok = false;

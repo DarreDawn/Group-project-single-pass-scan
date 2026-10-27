@@ -80,8 +80,8 @@ float measure_ms(Launch&& launch, unsigned iterations) {
 
 // Reset per-scan state in the same stream as the following kernel launch.
 // This keeps repeated benchmark iterations independent and includes setup in
-// the measured full-scan operation.
-template<class T, bool UseWarpReduction>
+// the measured full-scan operation. B and Q are the tile configuration.
+template<class T, int B, int Q, p2::ScanStrategy Strategy>
 void launch_full_scan(
     const T* input,
     T* output,
@@ -94,12 +94,15 @@ void launch_full_scan(
         descriptors.flags, 0,
         static_cast<std::size_t>(num_tiles) * sizeof(lookback::Flag), stream));
     CUDA_CHECK(cudaMemsetAsync(
+        descriptors.packed, 0,
+        static_cast<std::size_t>(num_tiles) * sizeof(uint64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
         descriptors.next_tile, 0, sizeof(unsigned), stream));
     CUDA_CHECK(cudaMemsetAsync(
         descriptors.error, 0, sizeof(unsigned), stream));
 
-    p2::full_kernel<T, 128, 4, UseWarpReduction>
-        <<<static_cast<unsigned>(num_tiles), 128, shared_bytes, stream>>>(
+    p2::full_kernel<T, B, Q, Strategy>
+        <<<static_cast<unsigned>(num_tiles), B, shared_bytes, stream>>>(
             input, output, n, num_tiles, descriptors);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -123,27 +126,127 @@ bool validate_result(
     return match;
 }
 
+// Benchmark one full-scan look-back strategy: reset per-scan state, launch,
+// check the device protocol error flag and the number of assigned tiles, then
+// validate the result against the CPU reference. Return the average time.
+template<class T, int B, int Q, p2::ScanStrategy Strategy>
+float bench_full_scan(
+    const char* label,
+    const T* input,
+    T* output,
+    std::size_t n,
+    std::size_t num_tiles,
+    p2::Descriptors<T> descriptors,
+    std::size_t shared_bytes,
+    cudaStream_t stream,
+    unsigned iterations,
+    const std::vector<T>& reference) {
+    const float ms = measure_ms([&] {
+        launch_full_scan<T, B, Q, Strategy>(
+            input, output, n, num_tiles, descriptors, shared_bytes, stream);
+    }, iterations);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    unsigned protocol_error = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &protocol_error, descriptors.error, sizeof(unsigned),
+        cudaMemcpyDeviceToHost));
+    if (protocol_error != 0) {
+        throw std::runtime_error(
+            std::string(label) + " look-back reported invalid descriptor state");
+    }
+    unsigned assigned_tiles = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &assigned_tiles, descriptors.next_tile, sizeof(unsigned),
+        cudaMemcpyDeviceToHost));
+    if (assigned_tiles != num_tiles) {
+        throw std::runtime_error(
+            std::string(label) + " full scan did not assign every tile");
+    }
+    if (!validate_result(label, output, n, reference)) {
+        throw std::runtime_error(std::string(label) + " differs from CPU reference");
+    }
+    return ms;
+}
+
+// Benchmark all four look-back strategies for one (B, Q) tile configuration.
+// num_tiles depends on B*Q, so descriptors are allocated per configuration.
+template<class T, int B, int Q>
+void bench_config(
+    const T* input,
+    std::size_t n,
+    unsigned iterations,
+    const std::vector<T>& reference,
+    const cudaDeviceProp& properties) {
+    constexpr std::size_t tile_size = static_cast<std::size_t>(B) * Q;
+    const std::size_t num_tiles = step1_test::tile_count(n, tile_size);
+    if (num_tiles > std::numeric_limits<unsigned>::max()) {
+        throw std::overflow_error("input requires too many scan tiles");
+    }
+    if (num_tiles > static_cast<std::size_t>(properties.maxGridSize[0])) {
+        throw std::overflow_error("input exceeds the device grid limit");
+    }
+
+    DeviceBuffer<T> d_baseline(n), d_prefetch(n), d_reduced(n), d_fencefree(n),
+        d_aggregates(num_tiles), d_prefixes(num_tiles);
+    DeviceBuffer<lookback::Flag> d_flags(num_tiles);
+    DeviceBuffer<uint64_t> d_packed(num_tiles);
+    DeviceBuffer<unsigned> d_next(1), d_error(1);
+
+    p2::Descriptors<T> descriptors{
+        d_flags.get(), d_aggregates.get(), d_prefixes.get(),
+        d_next.get(), d_error.get(), d_packed.get()};
+    constexpr std::size_t shared_bytes =
+        sizeof(step1::BlockScanScratch<T, B, Q>);
+    const cudaStream_t stream = nullptr;
+
+    // Four look-back variants: Step-3 baseline, Step-4 Opt1 (warp prefetch),
+    // Step-4 Opt2 (warp reduction), and paper §4.4 fence-free single-word
+    // descriptors. pflag was measured in an earlier sweep and never reached
+    // baseline (report §7.5), so it is removed and replaced by fence-free.
+    const float baseline_ms = bench_full_scan<T, B, Q, p2::ScanStrategy::Baseline>(
+        "baseline", input, d_baseline.get(), n, num_tiles, descriptors,
+        shared_bytes, stream, iterations, reference);
+    const float prefetch_ms = bench_full_scan<T, B, Q, p2::ScanStrategy::WarpPrefetch>(
+        "warp-prefetch", input, d_prefetch.get(), n, num_tiles, descriptors,
+        shared_bytes, stream, iterations, reference);
+    const float reduced_ms = bench_full_scan<T, B, Q, p2::ScanStrategy::WarpReduce>(
+        "warp-reduce", input, d_reduced.get(), n, num_tiles, descriptors,
+        shared_bytes, stream, iterations, reference);
+    const float fencefree_ms = bench_full_scan<T, B, Q, p2::ScanStrategy::FenceFree>(
+        "fence-free", input, d_fencefree.get(), n, num_tiles, descriptors,
+        shared_bytes, stream, iterations, reference);
+
+    // Count one input read and one output write for scans (2n movement).
+    const double scan_bytes = static_cast<double>(n) * sizeof(T) * 2.0;
+    const auto bandwidth = [](double bytes, float ms) {
+        return bytes / (static_cast<double>(ms) * 1.0e6);
+    };
+    std::cout << "Config B=" << B << " Q=" << Q << " tile=" << tile_size
+              << " tiles=" << num_tiles << '\n'
+              << "  baseline (Step3):   " << baseline_ms << " ms, effective "
+              << bandwidth(scan_bytes, baseline_ms) << " GB/s\n"
+              << "  warp-prefetch(Opt1):" << prefetch_ms << " ms, effective "
+              << bandwidth(scan_bytes, prefetch_ms) << " GB/s\n"
+              << "  warp-reduce (Opt2): " << reduced_ms << " ms, effective "
+              << bandwidth(scan_bytes, reduced_ms) << " GB/s\n"
+              << "  fence-free (§4.4):  " << fencefree_ms << " ms, effective "
+              << bandwidth(scan_bytes, fencefree_ms) << " GB/s\n";
+}
+
 // Run correctness checks before reporting timings so performance numbers are
 // never presented for a scan that disagrees with the CPU reference.
 template<class T>
 void run(std::size_t n, unsigned iterations) {
-    constexpr std::size_t tile_size = 128 * 4;
     if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::overflow_error(
             "n exceeds the CUB DeviceScan item-count limit");
-    }
-    const std::size_t num_tiles = step1_test::tile_count(n, tile_size);
-    if (num_tiles > std::numeric_limits<unsigned>::max()) {
-        throw std::overflow_error("input requires too many scan tiles");
     }
 
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-    if (num_tiles > static_cast<std::size_t>(properties.maxGridSize[0])) {
-        throw std::overflow_error("input exceeds the device grid limit");
-    }
 
     const auto input = step1_test::generate_dataset<T>(n, "random", 20261025);
     std::vector<T> reference(n);
@@ -153,63 +256,12 @@ void run(std::size_t n, unsigned iterations) {
         return;
     }
 
-    DeviceBuffer<T> d_input(n), d_full_serial(n), d_full_reduced(n),
-        d_cub_output(n), d_copy(n), d_aggregates(num_tiles), d_prefixes(num_tiles);
-    DeviceBuffer<lookback::Flag> d_flags(num_tiles);
-    DeviceBuffer<unsigned> d_next(1), d_error(1);
+    DeviceBuffer<T> d_input(n), d_cub_output(n), d_copy(n);
     CUDA_CHECK(cudaMemcpy(
         d_input.get(), input.data(), n * sizeof(T), cudaMemcpyHostToDevice));
-
-    p2::Descriptors<T> descriptors{
-        d_flags.get(), d_aggregates.get(), d_prefixes.get(),
-        d_next.get(), d_error.get()};
-    constexpr std::size_t shared_bytes =
-        sizeof(step1::BlockScanScratch<T, 128, 4>);
     const cudaStream_t stream = nullptr;
 
-    const float serial_ms = measure_ms([&] {
-        launch_full_scan<T, false>(
-            d_input.get(), d_full_serial.get(), n, num_tiles,
-            descriptors, shared_bytes, stream);
-    }, iterations);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    unsigned protocol_error = 0;
-    CUDA_CHECK(cudaMemcpy(
-        &protocol_error, d_error.get(), sizeof(unsigned), cudaMemcpyDeviceToHost));
-    if (protocol_error != 0) {
-        throw std::runtime_error("serial look-back reported invalid descriptor state");
-    }
-    unsigned assigned_tiles = 0;
-    CUDA_CHECK(cudaMemcpy(
-        &assigned_tiles, d_next.get(), sizeof(unsigned), cudaMemcpyDeviceToHost));
-    if (assigned_tiles != num_tiles) {
-        throw std::runtime_error("serial full scan did not assign every tile");
-    }
-    if (!validate_result("serial full scan", d_full_serial.get(), n, reference)) {
-        throw std::runtime_error("serial full scan differs from CPU reference");
-    }
-
-    const float reduced_ms = measure_ms([&] {
-        launch_full_scan<T, true>(
-            d_input.get(), d_full_reduced.get(), n, num_tiles,
-            descriptors, shared_bytes, stream);
-    }, iterations);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(
-        &protocol_error, d_error.get(), sizeof(unsigned), cudaMemcpyDeviceToHost));
-    if (protocol_error != 0) {
-        throw std::runtime_error("warp-reduction look-back reported invalid descriptor state");
-    }
-    CUDA_CHECK(cudaMemcpy(
-        &assigned_tiles, d_next.get(), sizeof(unsigned), cudaMemcpyDeviceToHost));
-    if (assigned_tiles != num_tiles) {
-        throw std::runtime_error("warp-reduction full scan did not assign every tile");
-    }
-    if (!validate_result("warp-reduction full scan",
-                         d_full_reduced.get(), n, reference)) {
-        throw std::runtime_error("warp-reduction full scan differs from CPU reference");
-    }
-
+    // CUB and memcpy do not depend on B/Q; measure them once per (n, type).
     std::size_t cub_temp_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::InclusiveSum(
         nullptr, cub_temp_bytes, d_input.get(), d_cub_output.get(), n, stream));
@@ -231,22 +283,26 @@ void run(std::size_t n, unsigned iterations) {
 
     // Count one input read and one output write for scans. The copy metric
     // counts only its payload, so the two bandwidth figures describe
-    // different byte counts.
+    // different byte counts (scan: 2n, memcpy: n).
     const double input_bytes = static_cast<double>(n) * sizeof(T);
     const double scan_bytes = input_bytes * 2.0;
     const auto bandwidth = [](double bytes, float ms) {
         return bytes / (static_cast<double>(ms) * 1.0e6);
     };
     std::cout << "n=" << n << " type=u" << sizeof(T) * 8
-              << " tiles=" << num_tiles << " iterations=" << iterations << '\n'
-              << "  full serial:       " << serial_ms << " ms, effective "
-              << bandwidth(scan_bytes, serial_ms) << " GB/s\n"
-              << "  full warp reduce:  " << reduced_ms << " ms, effective "
-              << bandwidth(scan_bytes, reduced_ms) << " GB/s\n"
-              << "  CUB DeviceScan:    " << cub_ms << " ms, effective "
+              << " iterations=" << iterations << '\n'
+              << "  CUB DeviceScan:      " << cub_ms << " ms, effective "
               << bandwidth(scan_bytes, cub_ms) << " GB/s\n"
-              << "  D2D memcpy:        " << memcpy_ms << " ms, payload "
+              << "  D2D memcpy:          " << memcpy_ms << " ms, payload "
               << bandwidth(input_bytes, memcpy_ms) << " GB/s\n";
+
+    // Tile-granularity ablation: B x Q across the four look-back strategies.
+    bench_config<T, 128, 4>(d_input.get(), n, iterations, reference, properties);
+    bench_config<T, 128, 8>(d_input.get(), n, iterations, reference, properties);
+    bench_config<T, 128, 16>(d_input.get(), n, iterations, reference, properties);
+    bench_config<T, 256, 4>(d_input.get(), n, iterations, reference, properties);
+    bench_config<T, 256, 8>(d_input.get(), n, iterations, reference, properties);
+    bench_config<T, 256, 16>(d_input.get(), n, iterations, reference, properties);
 }
 
 uint64_t parse_number(const char* text, const char* label) {
